@@ -1,0 +1,6 @@
+.env
+result*
+*.html
+*.ipynb
+*.csv
+__pycache__/
