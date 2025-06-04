@@ -1,5 +1,7 @@
 # run_scrapper.py
 
+import utils.transport
+import utils.session
 from core import run_scrape
 import os
 import shutil

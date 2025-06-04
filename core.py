@@ -329,12 +329,15 @@ def generate_random_payload(idx: int, run_dir: str) -> dict:
 
 
 # ─── 2.8 The Main Scrape Workflow (modified run_scrape) ───────────────────────────
+# core.py (excerpt)
+# (Keep your existing imports, e.g. solve_captcha, parse_dmv_response_and_save, etc.)
+
 def run_scrape(idx: int, output_dir: str):
     run_dir = os.path.join(output_dir, str(idx))
     os.makedirs(run_dir, exist_ok=True)
-    configure_logger(run_dir)  # start logging to results/{idx}/scraper_debug.log
+    configure_logger(run_dir)  # writes to results/{idx}/scraper_debug.log
 
-    # 1) Prepare a single Session (to preserve cookies)
+    # ─── 1) Prepare a single Session (preserve cookies) ──────────────────────
     session = requests.Session()
     session.headers.update({
         "User-Agent": (
@@ -344,7 +347,7 @@ def run_scrape(idx: int, output_dir: str):
         "Referer": os.getenv("PAGE_URL", "")
     })
 
-    # 2) Fetch the form page (sets session cookies)
+    # ─── 2) GET the form page ────────────────────────────────────────────────
     try:
         form_resp = timed_get(session, os.getenv("PAGE_URL"), run_dir)
     except Exception as e:
@@ -356,20 +359,22 @@ def run_scrape(idx: int, output_dir: str):
         f.write(form_html)
     logging.info("[I/O] Wrote form.html")
 
-    # 3) Extract ALL hidden fields under <form id="FeeRequestForm">
+    # ─── 3) Extract ALL hidden fields, save to hidden_fields.json ────────────
     soup = BeautifulSoup(form_html, "html.parser")
     hidden_fields = {}
     for inp in soup.select("form#FeeRequestForm input[type='hidden']"):
         name = inp.get("name")
         if name:
             hidden_fields[name] = inp.get("value", "")
-    logging.info(f"[HiddenFields] Extracted {len(hidden_fields)} keys: {list(hidden_fields.keys())}")
+    with open(os.path.join(run_dir, "hidden_fields.json"), "w", encoding="utf-8") as f:
+        json.dump(hidden_fields, f, indent=2)
+    logging.info(f"[HiddenFields] Extracted {len(hidden_fields)} keys and saved to hidden_fields.json")
 
-    # 4) Generate random payload, then merge with hidden_fields
+    # ─── 4) Generate random payload and merge with hidden_fields ─────────────
     payload = generate_random_payload(idx, run_dir)
     form_data = {**hidden_fields, **payload}
 
-    # 5) Solve CAPTCHA (using the same session), with fallback if it times out
+    # ─── 5) Solve CAPTCHA (same session), with one retry if needed ───────────
     start_captcha = time.time()
     try:
         captcha_token = solve_captcha(session, form_html, run_dir)
@@ -391,39 +396,62 @@ def run_scrape(idx: int, output_dir: str):
 
     form_data["g-recaptcha-response"] = captcha_token
 
-    # 6) Save the combined form_data for debugging
-    save_json(form_data, os.path.join(run_dir, "form_data.json"))
+    # ─── 6) Save form_data.json ───────────────────────────────────────────────
+    form_data_path = os.path.join(run_dir, "form_data.json")
+    save_json(form_data, form_data_path)
+    logging.info(f"[Payload] Saved combined form_data to {form_data_path}")
 
-    # 7) Submit the form using the same session (so cookies + Referer persist)
+    # ─── 7) BEFORE POST: capture request info (headers, cookies, body) ──────
+    request_info = {
+        "url": os.getenv("SUBMIT_URL"),
+        "method": "POST",
+        "request_headers": dict(session.headers),
+        "cookies": session.cookies.get_dict(),
+        "body_form_data": form_data
+    }
+    with open(os.path.join(run_dir, "request_info.json"), "w", encoding="utf-8") as f:
+        json.dump(request_info, f, indent=2)
+    logging.info(f"[DEBUG] Wrote request_info.json (headers, cookies, form_data)")
+
+    # ─── 8) Submit the form with the same session ────────────────────────────
     try:
         submit_resp = timed_post(session, os.getenv("SUBMIT_URL"), form_data, run_dir)
     except Exception as e:
         logging.exception(f"[run_scrape#{idx}] Failed to POST form; aborting run. {e}")
         return
 
-    # 8) Write response HTML
+    # ─── 9) Write response.html ──────────────────────────────────────────────
+    resp_html = submit_resp.text
     resp_path = os.path.join(run_dir, "response.html")
     with open(resp_path, "w", encoding="utf-8") as f:
-        f.write(submit_resp.text)
+        f.write(resp_html)
     logging.info("[I/O] Wrote response.html")
 
-    # 9) Pre-parse sanity checks: look for “Session Not Verified” or form-validation errors
-    html_lower = submit_resp.text.lower()
+    # ─── 10) Save response_info.json (status code + response headers) ───────
+    response_info = {
+        "status_code": submit_resp.status_code,
+        "response_headers": dict(submit_resp.headers)
+    }
+    with open(os.path.join(run_dir, "response_info.json"), "w", encoding="utf-8") as f:
+        json.dump(response_info, f, indent=2)
+    logging.info(f"[DEBUG] Wrote response_info.json (status_code, response_headers)")
+
+    # ─── 11) Pre-parse sanity checks ─────────────────────────────────────────
+    html_lower = resp_html.lower()
     if "session not verified" in html_lower:
         logging.error(f"[run_scrape#{idx}] DMV returned “Session Not Verified”. Aborting parse.")
         return
 
-    # If the form re-rendered with validation errors, there will be an error banner but no fees
-    if '<div class="alert alert--error">' in submit_resp.text and "<legend>calculate new resident fees</legend>" in html_lower:
+    if '<div class="alert alert--error"' in resp_html and "<legend>calculate new resident fees</legend>" in html_lower:
         logging.error(f"[run_scrape#{idx}] DMV re-rendered form with validation errors. Aborting parse.")
         return
 
-    # 10) Parse and save CSVs (with error capture)
+    # ─── 12) Parse and save CSVs ──────────────────────────────────────────────
     summary_csv = os.path.join(run_dir, "summary.csv")
     detail_csv = os.path.join(run_dir, "detailed.csv")
     try:
         parse_dmv_response_and_save(
-            html=submit_resp.text,
+            html=resp_html,
             summary_csv_path=summary_csv,
             detail_csv_path=detail_csv,
             run_dir=run_dir
