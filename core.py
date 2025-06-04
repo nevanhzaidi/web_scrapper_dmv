@@ -1,177 +1,178 @@
-import os
-import json
-import logging
-from datetime import datetime
-from typing import Tuple, Dict, Any
-import random
+# core.py
 
+import os
+import time
+import random
+from datetime import date, timedelta
+import logging
+import json
 import requests
 from bs4 import BeautifulSoup
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import parse_qs
 from anticaptchaofficial.recaptchav3proxyless import recaptchaV3Proxyless
-
 from parser import parse_dmv_response_and_save
+from dotenv import load_dotenv
+load_dotenv()
 
-# Configuration
-PAGE_URL = os.getenv("PAGE_URL", "https://www.dmv.ca.gov/wasapp/FeeCalculatorWeb/newResidentForm.do")
-SUBMIT_URL = os.getenv("SUBMIT_URL", "https://www.dmv.ca.gov/wasapp/FeeCalculatorWeb/newResidentFees.do")
-API_KEY = os.getenv("ANTICAPTCHA_KEY")
-if not API_KEY:
-    raise RuntimeError("Please set the ANTICAPTCHA_KEY environment variable")
+# ─── 2.1 Configure Logging ─────────────────────────────────────────────────────
+# We’ll log to a file named 'scraper_debug.log' inside each run’s directory.
+def configure_logger(run_dir: str):
+    os.makedirs(run_dir, exist_ok=True)
+    log_path = os.path.join(run_dir, "scraper_debug.log")
 
-CAPTCHA_TIMEOUT = int(os.getenv("CAPTCHA_TIMEOUT", 60))  # seconds
+    # Create or overwrite the log file for this run
+    for handler in logging.root.handlers[:]:
+        logging.root.removeHandler(handler)
 
-# Logging Setup
-logger = logging.getLogger(__name__)
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S"
-)
+    logging.basicConfig(
+        level=logging.DEBUG,
+        format="%(asctime)s %(levelname)s: %(message)s",
+        handlers=[
+            logging.FileHandler(log_path, mode="w", encoding="utf-8"),
+            logging.StreamHandler()  # also print to console
+        ]
+    )
+    logging.info(f"Logging initialized. Writing to {log_path}")
 
 
-def extract_recaptcha_config(html: str) -> Tuple[str, str]:
+# ─── 2.2 Helper Functions for Timed HTTP ────────────────────────────────────────
+def timed_get(session: requests.Session, url: str, run_dir: str) -> requests.Response:
     """
-    Extract ReCAPTCHA v3 sitekey and action from HTML.
+    Perform a GET and log status, timing, and a snippet of the response.
+    """
+    start = time.time()
+    logging.info(f"→ GET {url}")
+    try:
+        resp = session.get(url, timeout=60)
+        elapsed = (time.time() - start) * 1000
+        logging.info(f"← {resp.status_code} {url} ({elapsed:.0f} ms)")
+        # Log a small snippet of HTML for debugging (first 500 chars)
+        snippet = resp.text.replace("\n", " ").strip()[:500]
+        logging.debug(f"   HTML snippet: {snippet + ('…[truncated]' if len(resp.text) > 500 else '')}")
+        return resp
+    except Exception as e:
+        elapsed = (time.time() - start) * 1000
+        logging.error(f"✖ GET {url} failed after {elapsed:.0f} ms: {e}")
+        raise
+
+
+def timed_post(session: requests.Session, url: str, data: dict, run_dir: str) -> requests.Response:
+    """
+    Perform a POST and log status, timing, and a snippet of the response or error.
+    """
+    start = time.time()
+    logging.info(f"→ POST {url} (payload keys: {list(data.keys())})")
+    try:
+        resp = session.post(url, data=data, timeout=60)
+        elapsed = (time.time() - start) * 1000
+        logging.info(f"← {resp.status_code} {url} ({elapsed:.0f} ms)")
+        # Log small snippet of HTML (first 500 chars)
+        snippet = resp.text.replace("\n", " ").strip()[:500]
+        logging.debug(f"   HTML snippet: {snippet + ('…[truncated]' if len(resp.text) > 500 else '')}")
+        return resp
+    except Exception as e:
+        elapsed = (time.time() - start) * 1000
+        logging.error(f"✖ POST {url} failed after {elapsed:.0f} ms: {e}")
+        raise
+
+
+# ─── 2.3 Extract ReCAPTCHA Config (unchanged) ─────────────────────────────────────
+def extract_recaptcha_config(html: str):
+    """
+    Parse the page’s <script src="…recaptchav3.js?sitekey=…&selector=…&action=…">
+    and return (sitekey, action).
     """
     soup = BeautifulSoup(html, "html.parser")
-    tag = soup.find("script", src=lambda s: s and "recaptchav3.js" in s)
-    if not tag:
+
+    # Find the <script> tag whose `src` contains "recaptchav3.js"
+    script_tag = soup.find("script", attrs={"src": lambda s: s and "recaptchav3.js" in s})
+    if not script_tag:
+        logging.error("[Captcha] Could not find ReCAPTCHA v3 loader script in page HTML.")
         raise RuntimeError("Could not find ReCAPTCHA v3 loader script in page HTML.")
-    qs = parse_qs(urlparse(tag["src"]).query)
-    sitekey = qs.get("sitekey", [""])[0]
-    action = qs.get("action", [""])[0]
-    if not sitekey or not action:
-        raise RuntimeError("Empty ReCAPTCHA config: sitekey=%r, action=%r" % (sitekey, action))
+
+    src = script_tag["src"]
+    # Everything after the first "?" is the query string
+    qs = src.split("?", 1)[1]
+    params = parse_qs(qs)
+
+    # CA DMV uses "sitekey" (not "render")
+    sitekey = params.get("sitekey", [""])[0]
+    action  = params.get("action",  [""])[0]
+
+    if not sitekey:
+        logging.error(f"[Captcha] Found recaptchav3.js tag, but sitekey was empty. Raw src: {src}")
+        raise RuntimeError("Empty sitekey—cannot solve CAPTCHA.")
+
+    logging.info(f"[Captcha] Extracted sitekey='{sitekey}', action='{action}'")
     return sitekey, action
 
 
-def solve_captcha(session: requests.Session, html: str) -> str:
-    """
-    Solve ReCAPTCHA v3 and return token.
-    """
+# ─── 2.4 Solve CAPTCHA with Timing ───────────────────────────────────────────────
+def solve_captcha(session: requests.Session, html: str, run_dir: str) -> str:
     sitekey, action = extract_recaptcha_config(html)
+
     solver = recaptchaV3Proxyless()
     solver.set_verbose(1)
-    solver.set_key(API_KEY)
-    solver.set_website_url(PAGE_URL)
+    solver.set_key(os.getenv("ANTICAPTCHA_KEY") or "")
+    solver.set_website_url(os.getenv("PAGE_URL") or "")
     solver.set_website_key(sitekey)
-    solver.set_page_action(action)
+    solver.set_page_action(action)     # ← use set_page_action, not set_website_action
     solver.set_min_score(0.3)
 
-    logger.info(f"Solving ReCAPTCHA V3 (sitekey={sitekey}, action={action})")
+    logging.info("[Captcha] Starting to solve ReCAPTCHA V3…")
+    start = time.time()
     token = solver.solve_and_return_solution()
+    elapsed = (time.time() - start) * 1000
     if not token:
-        logger.error("ReCAPTCHA v3 solve failed: %s", solver.error_code)
-        raise RuntimeError(f"CAPTCHA solve failed: {solver.error_code}")
-    logger.info("ReCAPTCHA solved successfully.")
+        error_code = solver.error_code
+        logging.error(f"[Captcha] No token returned; solver.error_code = {error_code} (in {elapsed:.0f} ms)")
+        raise RuntimeError(f"Captcha failed: {error_code}")
+    logging.info(f"[Captcha] Received token (first 20 chars): {token[:20]}… (in {elapsed:.0f} ms)")
     return token
 
 
-def save_json(data: Dict[str, Any], path: str) -> None:
+# ─── 2.5 Extract Hidden Fields ───────────────────────────────────────────────────
+def extract_hidden_fields(html: str, run_dir: str) -> dict:
     """
-    Save dictionary as JSON file, creating directories if needed.
+    Find all <input type='hidden'> under form#FeeRequestForm and return name->value.
     """
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, 'w', encoding='utf-8') as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+    soup = BeautifulSoup(html, "html.parser")
+    form = soup.find("form", attrs={"id": "FeeRequestForm"})
+    if not form:
+        logging.warning("[HiddenFields] <form id='FeeRequestForm'> not found in HTML.")
+        return {}
+
+    hidden = {}
+    for inp in form.find_all("input", type="hidden"):
+        name = inp.get("name")
+        value = inp.get("value", "")
+        if name:
+            hidden[name] = value
+
+    logging.info(f"[HiddenFields] Extracted {len(hidden)} hidden fields: {list(hidden.keys())}")
+    return hidden
 
 
-def run_scrape(idx: int, output_dir: str) -> None:
-    """
-    Main scraping workflow: fetch form, populate payload, solve captcha, submit form, parse response.
-    """
-    session = requests.Session()
-    headers = {
-        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) Chrome/136.0.0.0 Safari/537.36",
-        "Referer": PAGE_URL,
-        # add other headers as needed
-    }
-    result_dir = os.path.join(output_dir, str(idx))
-    os.makedirs(result_dir, exist_ok=True)
-
-    # STEP 1: GET form page
-    logger.info("[%d] Fetching form page", idx)
-    response = session.get(PAGE_URL, headers=headers)
-    response.raise_for_status()
-    with open(os.path.join(result_dir, 'form.html'), 'w', encoding='utf-8') as f:
-        f.write(response.text)
-
-    # STEP 2: Extract hidden fields
-    hidden_fields = extract_hidden_fields(response.text)
-
-    # STEP 3: Generate payload
-    payload = generate_random_payload(idx)
-    form_data = {**hidden_fields, **payload}
-
-    # STEP 4: Solve captcha with timeout handling
-    token = _get_token_with_refresh(session, response.text, payload, idx)
-    form_data['g-recaptcha-response'] = token
-
-    # Save payload for debugging
-    save_json(form_data, os.path.join(result_dir, 'payload.json'))
-
-    # STEP 5: Submit POST
-    logger.info("[%d] Submitting form", idx)
-    post_resp = session.post(SUBMIT_URL, data=form_data, headers={**headers, "Content-Type": "application/x-www-form-urlencoded"})
-    post_resp.raise_for_status()
-    with open(os.path.join(result_dir, 'response.html'), 'w', encoding='utf-8') as f:
-        f.write(post_resp.text)
-
-    # STEP 6: Parse and save CSVs
-    summary_csv = os.path.join(result_dir, 'summary.csv')
-    detail_csv = os.path.join(result_dir, 'detailed.csv')
-    parse_dmv_response_and_save(post_resp.text, summary_csv, detail_csv)
-
-
-def _get_token_with_refresh(session: requests.Session, html: str, payload: Dict[str, Any], idx: int) -> str:
-    """
-    Solve captcha, and refresh session if timeout exceeded.
-    """
-    start = datetime.now()
-    try:
-        return solve_captcha(session, html)
-    except RuntimeError as e:
-        elapsed = (datetime.now() - start).total_seconds()
-        if elapsed > CAPTCHA_TIMEOUT:
-            logger.warning("[%d] Captcha solve took %.1fs > %ds, refreshing session", idx, elapsed, CAPTCHA_TIMEOUT)
-            response = session.get(PAGE_URL)
-            response.raise_for_status()
-            return solve_captcha(session, response.text)
-        raise e
-
-def save_payload(payload: dict, path: str):
+# ─── 2.6 Save JSON Utility (unchanged) ────────────────────────────────────────────
+def save_json(data: dict, path: str):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
-        json.dump(payload, f, ensure_ascii=False, indent=2)
-
-def extract_hidden_fields(html: str) -> Dict[str, str]:
-    """
-    Extract hidden input fields from the form.
-    """
-    soup = BeautifulSoup(html, 'html.parser')
-    return {inp['name']: inp.get('value', '') for inp in soup.select('form#FeeRequestForm input[type=hidden]') if inp.get('name')}
+        json.dump(data, f, indent=2)
+    logging.info(f"[I/O] Saved JSON to {path}")
 
 
-if __name__ == '__main__':
-    import argparse
+# ─── 2.7 Generate Random Payload (unchanged, aside from logging) ───────────────────
 
-    parser = argparse.ArgumentParser(description='Run DMV fee scraper')
-    parser.add_argument('-n', '--num', type=int, default=1, help='Number of scrapes')
-    parser.add_argument('-o', '--output', default='results', help='Output directory')
-    args = parser.parse_args()
-    for i in range(args.num):
-        run_scrape(i, args.output)
-
-
-
-def generate_random_payload(idx: int) -> dict:
+def generate_random_payload(idx: int, run_dir: str) -> dict:
     """
     Generates a fully-populated payload for the DMV new resident fee calculator,
-    combining all original option sets with deterministic weight-range logic
-    and valid county→city→zip mapping.
+    ensuring all dates are valid (≤ today, and purchase ≥ operated), and selecting
+    appropriate weight ranges and county→city→ZIP mappings. If the vehicle type
+    is “Trailer” (code "40"), also supplies a valid trailerType. Any field whose
+    value is an empty string is omitted from the final payload.
     """
-    current_year = datetime.today().year
+    today = date.today()
+    current_year = today.year
 
     # ── Original option tables ────────────────────────────────────────────────
     vehicle_types = {
@@ -249,73 +250,187 @@ def generate_random_payload(idx: int) -> dict:
         "San Diego":   ("San Diego",   "SANDIEGO",    "92101"),
     }
 
-    # ── Random Dates ───────────────────────────────────────────────────────────
-    operated = datetime(
-        year=random.randint(current_year-1, current_year),
-        month=random.randint(1, 12),
-        day=random.randint(1, 28)
+    # ── Generate Valid Dates ────────────────────────────────────────────────────
+    # 1) "First Operated in CA" must be ≤ today and at least within the past year
+    earliest_operated = today - timedelta(days=365)
+    operated_date = earliest_operated + timedelta(
+        days=random.randint(0, (today - earliest_operated).days)
     )
-    purchased = datetime(
-        year=random.randint(current_year-1, current_year),
-        month=random.randint(1, 12),
-        day=random.randint(1, 28)
+
+    # 2) "Purchase Date" must be ≥ operated_date and ≤ today
+    purchase_start = operated_date
+    purchase_date = purchase_start + timedelta(
+        days=random.randint(0, (today - purchase_start).days)
     )
 
     # ── Random Selections ───────────────────────────────────────────────────────
     vt = random.choice(list(vehicle_types.values()))
     mp = random.choice(list(motive_powers.values()))
-    # secondary motive power unused by form; left here for completeness
     smp = random.choice(list(secondary_motive_powers.values()))
     ax = random.choice(list(axle_options.values()))
+
     county_name = random.choice(list(county_cities.keys()))
     county_code = counties[county_name]
     city_label, city_val, zip_code = county_cities[county_name]
+
     acq = random.choice(list(acquired_from_options.values()))
 
     # ── Build Base Payload ─────────────────────────────────────────────────────
     payload = {
-        "typeLicense":            vt,
-        "yearModel":              str(random.randint(1990, current_year)),
-        "motive-power":           mp,
-        "motivePower":            mp,
-        # secondary motive not sent — preserved in payload for debugging
-        "secondaryMotivePower":   smp,
-        "numberOfAxles":          ax,
-        "electricType":           random.choice(list(electric_types.values())) if mp == "E" else "",
-        "operatedMonth":          f"{operated.month:02d}",
-        "operatedDay":            f"{operated.day:02d}",
-        "operatedYear":           str(operated.year),
-        "purchaseMonth":          f"{purchased.month:02d}",
-        "purchaseDay":            f"{purchased.day:02d}",
-        "purchaseYear":           str(purchased.year),
-        "acquiredFrom":           acq,
-        "purchasePrice":          str(random.randint(1000, 100000)),
-        "useTaxCredit":           str(random.randint(0, 5000)),
-        "countyCode":             county_code,
-        "countyNameLabel":        county_name,
-        "cityNameLabel":          city_label,
-        "cityName":               city_val,
-        "zipCode":                zip_code,
+        "typeLicense":          vt,
+        "yearModel":            str(random.randint(1990, current_year)),
+        "motivePower":          mp,
+        "secondaryMotivePower": smp,
+        "numberOfAxles":        ax,
+        "operatedMonth":        f"{operated_date.month:02d}",
+        "operatedDay":          f"{operated_date.day:02d}",
+        "operatedYear":         str(operated_date.year),
+        "purchaseMonth":        f"{purchase_date.month:02d}",
+        "purchaseDay":          f"{purchase_date.day:02d}",
+        "purchaseYear":         str(purchase_date.year),
+        "acquiredFrom":         acq,
+        "purchasePrice":        str(random.randint(1000, 100000)),
+        "useTaxCredit":         str(random.randint(0, 5000)),
+        "countyCode":           county_code,
+        "countyNameLabel":      county_name,
+        "cityNameLabel":        city_label,
+        "cityName":             city_val,
+        "zipCode":              zip_code,
     }
+
+    # If electric, pick an electric subcategory; otherwise omit from payload
+    if mp == "E":
+        payload["electricType"] = random.choice(list(electric_types.values()))
 
     # ── WeightType + Matching Range ───────────────────────────────────────────
     wt = random.choice(list(weight_types.values()))
     payload["weightType"] = wt
     if wt == "U":
-        # unladen for two-axle vs multi-axle
         if ax == "2":
             payload["unladenRangeTwoAxles"] = random.choice(list(unladen_ranges_two_axles.values()))
-            payload["unladenRangeMoreThanTwoAxles"] = ""
         else:
             payload["unladenRangeMoreThanTwoAxles"] = random.choice(list(unladen_ranges_two_axles.values()))
-            payload["unladenRangeTwoAxles"] = ""
-        payload["grossRange"] = ""
     else:
         payload["grossRange"] = random.choice(list(gross_ranges.values()))
-        payload["unladenRangeTwoAxles"] = ""
-        payload["unladenRangeMoreThanTwoAxles"] = ""
 
-    # ── Persist for Debug ───────────────────────────────────────────────────────
-    save_payload(payload, f"results/{idx}/payload.json")
+    # ── If Trailer (vt == "40"), supply a valid trailerType; otherwise omit
+    if vt == "40":
+        trailer_types = ["PTI", "CCH", "CCHPT"]
+        payload["trailerType"] = random.choice(trailer_types)
 
-    return payload
+    # ── Remove any keys whose value is an empty string ────────────────────────
+    filtered_payload = {k: v for k, v in payload.items() if v != ""}
+
+    # ── Save and Log ────────────────────────────────────────────────────────────
+    save_json(filtered_payload, os.path.join(run_dir, "payload.json"))
+    logging.info(f"[Payload] Generated payload (keys: {list(filtered_payload.keys())}) saved to payload.json")
+
+    return filtered_payload
+
+
+# ─── 2.8 The Main Scrape Workflow (modified run_scrape) ───────────────────────────
+def run_scrape(idx: int, output_dir: str):
+    run_dir = os.path.join(output_dir, str(idx))
+    os.makedirs(run_dir, exist_ok=True)
+    configure_logger(run_dir)  # start logging to results/{idx}/scraper_debug.log
+
+    # 1) Prepare a single Session (to preserve cookies)
+    session = requests.Session()
+    session.headers.update({
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/90.0.0.0 Safari/537.36"
+        ),
+        "Referer": os.getenv("PAGE_URL", "")
+    })
+
+    # 2) Fetch the form page (sets session cookies)
+    try:
+        form_resp = timed_get(session, os.getenv("PAGE_URL"), run_dir)
+    except Exception as e:
+        logging.exception(f"[run_scrape#{idx}] Failed to GET form page; aborting run. {e}")
+        return
+
+    form_html = form_resp.text
+    with open(os.path.join(run_dir, "form.html"), "w", encoding="utf-8") as f:
+        f.write(form_html)
+    logging.info("[I/O] Wrote form.html")
+
+    # 3) Extract ALL hidden fields under <form id="FeeRequestForm">
+    soup = BeautifulSoup(form_html, "html.parser")
+    hidden_fields = {}
+    for inp in soup.select("form#FeeRequestForm input[type='hidden']"):
+        name = inp.get("name")
+        if name:
+            hidden_fields[name] = inp.get("value", "")
+    logging.info(f"[HiddenFields] Extracted {len(hidden_fields)} keys: {list(hidden_fields.keys())}")
+
+    # 4) Generate random payload, then merge with hidden_fields
+    payload = generate_random_payload(idx, run_dir)
+    form_data = {**hidden_fields, **payload}
+
+    # 5) Solve CAPTCHA (using the same session), with fallback if it times out
+    start_captcha = time.time()
+    try:
+        captcha_token = solve_captcha(session, form_html, run_dir)
+    except Exception as e:
+        elapsed = (time.time() - start_captcha) * 1000
+        logging.warning(f"[Captcha] First solve attempt failed after {elapsed:.0f} ms: {e}")
+        if elapsed > int(os.getenv("CAPTCHA_TIMEOUT", "60000")):
+            logging.info("[Captcha] Retrying: re-fetching form page…")
+            try:
+                retry_resp = timed_get(session, os.getenv("PAGE_URL"), run_dir)
+                new_html = retry_resp.text
+                captcha_token = solve_captcha(session, new_html, run_dir)
+            except Exception as e2:
+                logging.exception(f"[Captcha] Retry also failed! Aborting run. {e2}")
+                return
+        else:
+            logging.exception("[Captcha] Solve failed (not timeout). Aborting run.")
+            return
+
+    form_data["g-recaptcha-response"] = captcha_token
+
+    # 6) Save the combined form_data for debugging
+    save_json(form_data, os.path.join(run_dir, "form_data.json"))
+
+    # 7) Submit the form using the same session (so cookies + Referer persist)
+    try:
+        submit_resp = timed_post(session, os.getenv("SUBMIT_URL"), form_data, run_dir)
+    except Exception as e:
+        logging.exception(f"[run_scrape#{idx}] Failed to POST form; aborting run. {e}")
+        return
+
+    # 8) Write response HTML
+    resp_path = os.path.join(run_dir, "response.html")
+    with open(resp_path, "w", encoding="utf-8") as f:
+        f.write(submit_resp.text)
+    logging.info("[I/O] Wrote response.html")
+
+    # 9) Pre-parse sanity checks: look for “Session Not Verified” or form-validation errors
+    html_lower = submit_resp.text.lower()
+    if "session not verified" in html_lower:
+        logging.error(f"[run_scrape#{idx}] DMV returned “Session Not Verified”. Aborting parse.")
+        return
+
+    # If the form re-rendered with validation errors, there will be an error banner but no fees
+    if '<div class="alert alert--error">' in submit_resp.text and "<legend>calculate new resident fees</legend>" in html_lower:
+        logging.error(f"[run_scrape#{idx}] DMV re-rendered form with validation errors. Aborting parse.")
+        return
+
+    # 10) Parse and save CSVs (with error capture)
+    summary_csv = os.path.join(run_dir, "summary.csv")
+    detail_csv = os.path.join(run_dir, "detailed.csv")
+    try:
+        parse_dmv_response_and_save(
+            html=submit_resp.text,
+            summary_csv_path=summary_csv,
+            detail_csv_path=detail_csv,
+            run_dir=run_dir
+        )
+        logging.info(f"[run_scrape#{idx}] Parsing succeeded, CSVs written.")
+    except Exception as e:
+        logging.exception(f"[run_scrape#{idx}] Parsing failed. {e}")
+        return
+
+    logging.info(f"[run_scrape#{idx}] Completed successfully.")
